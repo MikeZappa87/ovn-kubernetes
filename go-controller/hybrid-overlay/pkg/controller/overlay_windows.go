@@ -4,13 +4,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
+	"strings"
 
 	"github.com/Microsoft/hcsshim/hcn"
 	"k8s.io/klog/v2"
 
-	ps "github.com/bhendo/go-powershell"
-	psBackend "github.com/bhendo/go-powershell/backend"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
+
+	ps "github.com/bhendo/go-powershell"
 )
 
 // Datastore for NetworkInfo.
@@ -266,53 +268,57 @@ func EnsureExistingNetworkIsValid(networkName string, expectedAddressPrefix stri
 	return nil
 }
 
-// duplicateIPv4Routes duplicates all the IPv4 network routes associated with the physical interface to the host vNIC,
-// where parameters policyStore and destinationPrefix are optional and could be used as filtering criteria.
-// Otherwise, all IPv4 routes will be forwarded from the physical interface to the host vNIC.
-func duplicateIPv4Routes(policyStore, destinationPrefix string) error {
-	shell, err := ps.New(&psBackend.Local{})
+func RestoreRoute(shell ps.Shell, ifIndex int, route WindowsRoute) {
+	_, stderr, err := shell.Execute(
+		fmt.Sprintf("New-NetRoute -InterfaceIndex '%v' -DestinationPrefix %v -NextHop %v -RouteMetric %v -PolicyStore ActiveStore",
+			ifIndex, route.DestinationPrefix, route.NextHop, route.RouteMetric))
+
 	if err != nil {
-		return err
+		fmt.Printf("unable to add routes, %v: %v", stderr, err)
 	}
-	defer shell.Exit()
+}
 
-	// build filter options for Get-NetRoute command. See https://docs.microsoft.com/en-us/powershell/module/nettcpip/get-netroute
-	var opts string
-	if policyStore != "" {
-		opts += fmt.Sprintf(" -PolicyStore %s", policyStore)
-	}
-	if destinationPrefix != "" {
-		opts += fmt.Sprintf(" -DestinationPrefix \"%s\"", destinationPrefix)
-	}
-
-	script := `
-	# Find physical adapters whose interfaces are bound to a vswitch (i.e. the MAC addresses match)
+func FindIndexAssociatedVNic(shell ps.Shell) int {
+	script :=
+		`# Find physical adapters whose interfaces are bound to a vswitch (i.e. the MAC addresses match)
 	$boundAdapters = (Get-NetAdapter -Physical | where { (Get-NetAdapter -Name "*vEthernet*").MacAddress -eq $_.MacAddress })
 
-	# Forward all the matching routes associated with the physical interface to the associated vNIC
-	foreach ($boundAdapter in $boundAdapters) {
-		$associatedVNic = Get-NetAdapter -Name "*vEthernet*" | where { $_.MacAddress -eq $boundAdapter.MacAddress }
-		$routes = Get-NetRoute` + opts + ` -AddressFamily IPv4 -InterfaceIndex $boundAdapter.IfIndex -ErrorAction SilentlyContinue
-		foreach ($route in $routes) {
-			netsh.exe int ipv4 add route interface=$($associatedVNic.ifIndex) prefix=$($route.DestinationPrefix) nexthop=$($route.NextHop) metric=$($route.RouteMetric) store=$($route.PolicyStore)
-		}
-	}
-	`
+	(Get-NetAdapter -Name "*vEthernet*" | where { $_.MacAddress -eq $boundAdapters[0].MacAddress }).ifIndex 
+`
+	output, stderr, err := shell.Execute(script)
 
-	if _, stderr, err := shell.Execute(script + "\r\n\r\n"); err != nil {
-		return fmt.Errorf("falied to duplicate network routes to the associated vNIC, %v: %v", stderr, err)
+	if err != nil {
+		fmt.Printf("stderr: %v err: %v", stderr, err)
 	}
 
-	return nil
+	v, _ := strconv.Atoi(strings.TrimRight(output, "\r\n"))
+
+	return v
 }
 
-func DuplicatePersistentIPRoutes() error {
-	return duplicateIPv4Routes("PersistentStore", "")
+func GetRoutes(shell ps.Shell) []WindowsRoute {
+	getroutescript := "Get-NetRoute -AddressFamily IPv4 | select InterfaceIndex,DestinationPrefix,NextHop,RouteMetric | ConvertTo-Json"
+
+	output, stderr, err := shell.Execute(getroutescript)
+
+	if err != nil {
+		fmt.Printf("unable to find routes, %v: %v", stderr, err)
+	}
+
+	var routes []WindowsRoute
+
+	err = json.Unmarshal([]byte(output), &routes)
+
+	if err != nil {
+		fmt.Printf("unable to parse: %v", err)
+	}
+
+	return routes
 }
 
-// DuplicateLinkLocalIPRoutes copies the routes for link-local addresses, that is 169.254.0.0/16 (169.254.0.0
-// through 169.254.255.255) for IPv4, that used to be on the physical network interface to the newly created host vNIC
-// See https://datatracker.ietf.org/doc/html/rfc3927
-func DuplicateLinkLocalIPRoutes() error {
-	return duplicateIPv4Routes("", "169.254.")
+type WindowsRoute struct {
+	InterfaceIndex    int    `json:"InterfaceIndex"`
+	DestinationPrefix string `json:"DestinationPrefix"`
+	NextHop           string `json:"NextHop"`
+	RouteMetric       int    `json:"RouteMetric"`
 }

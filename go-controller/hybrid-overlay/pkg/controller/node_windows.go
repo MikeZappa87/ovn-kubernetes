@@ -14,6 +14,8 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/Microsoft/hcsshim/hcn"
+	ps "github.com/bhendo/go-powershell"
+	psBackend "github.com/bhendo/go-powershell/backend"
 	iputils "github.com/containernetworking/plugins/pkg/ip"
 )
 
@@ -128,22 +130,26 @@ func ensureBaseNetwork() error {
 		return fmt.Errorf("unable to generate a schema to create a base overlay network, error: %v", err)
 	}
 
+	shell, err := ps.New(&psBackend.Local{})
+	if err != nil {
+		return fmt.Errorf("unable to setup powershell, this is fatal.")
+	}
+	defer shell.Exit()
+
+	previous := GetRoutes(shell)
+
 	klog.Infof("Base network creation may take up to a minute to complete...")
 	// Create the base network from schema object
 	if _, err = baseNetworkSchema.Create(); err != nil {
 		return fmt.Errorf("unable to create the base overlay network, error: %v", err)
 	}
 
-	// Workaround for a limitation in the Windows HNS service. We need
-	// to manually duplicate persistent routes that used to be on the
-	// physical network interface to the newly created host vNIC
-	if err = DuplicatePersistentIPRoutes(); err != nil {
-		return fmt.Errorf("unable to refresh the persistent IP routes, error: %v", err)
-	}
-	// Duplicate link-local addresses to the newly created host vNIC
-	klog.Infof("Forwarding routes associated with link-local addresses in the physical interface to the vNIC")
-	if err = DuplicateLinkLocalIPRoutes(); err != nil {
-		return fmt.Errorf("unable to refresh the link-local IP routes, error: %v", err)
+	index := FindIndexAssociatedVNic(shell)
+
+	for _, v := range previous {
+		if index == v.InterfaceIndex {
+			RestoreRoute(shell, index, v)
+		}
 	}
 
 	return nil
