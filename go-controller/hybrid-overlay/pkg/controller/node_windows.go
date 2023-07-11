@@ -22,6 +22,7 @@ import (
 const (
 	// Hard-coded constants
 	networkName = "OVNKubernetesHybridOverlayNetwork" // In practice, this is the virtual switch name
+	baseNetworkName = "BaseOVNKubernetesHybridOverlayNetwork"
 )
 
 // NodeController is the node hybrid overlay controller
@@ -92,7 +93,6 @@ func ensureBaseNetwork() error {
 	// while the base network remains across reboots.
 
 	const (
-		baseNetworkName = "BaseOVNKubernetesHybridOverlayNetwork"
 		fakeSubnetVNI   = types.HybridOverlayVNI + 1
 	)
 
@@ -233,7 +233,7 @@ func (n *NodeController) DeleteNode(node *kapi.Node) error {
 		// Just silently return, no need to clean up a non-initialized network
 		return nil
 	}
-
+	
 	network, err := hcn.GetNetworkByID(n.networkID)
 	if err != nil {
 		if _, isNotExist := err.(hcn.NetworkNotFoundError); !isNotExist {
@@ -250,6 +250,19 @@ func (n *NodeController) DeleteNode(node *kapi.Node) error {
 	if err := RemoveRemoteSubnetPolicy(network, nodeSubnet); err != nil {
 		return fmt.Errorf("error removing subnet policy '%s' node's annotations from network '%s' on node '%s'. Error: %v",
 			nodeSubnet, n.networkID, node.Name, err)
+	}
+	
+	for _,v := range []string{networkName, baseNetworkName} {
+		net, err := hcn.GetNetworkByName(v)
+
+		if err != nil {
+			return fmt.Errorf("unable to get the network by the name of '%s'. Error: %v", v, err)
+		}
+		
+		if err := net.Delete(); err != nil {
+			return fmt.Errorf("unable to delete hns network '%s' and may need to be manually removed. Error: %v",
+			 network.Name, err)
+		}
 	}
 
 	delete(n.remoteSubnetMap, node.Status.NodeInfo.MachineID)
